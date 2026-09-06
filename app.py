@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import io
+import json
 import math
-import zipfile
 from datetime import datetime
+from pathlib import Path
 from typing import Any
-import xml.etree.ElementTree as ET
 
 import pandas as pd
 import requests
@@ -20,6 +19,7 @@ st.set_page_config(
 )
 
 DART_BASE_URL = "https://opendart.fss.or.kr/api"
+CORP_CODES_FILE = Path(__file__).with_name("corp_codes.json")
 REPORT_CODE_ANNUAL = "11011"
 # OpenDART 서버가 일시적으로 느릴 때를 대비해 연결/응답 timeout을 분리합니다.
 CONNECT_TIMEOUT = 15
@@ -162,53 +162,36 @@ def dart_get(endpoint: str, params: dict[str, Any]) -> requests.Response:
     return response
 
 
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def load_corp_codes(api_key: str) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def load_corp_codes() -> pd.DataFrame:
     """
-    OpenDART 고유번호 ZIP/XML을 내려받아 기업 목록으로 변환합니다.
-    성공한 결과는 24시간 캐시되므로 Streamlit 재실행 때마다 다시 다운로드하지 않습니다.
+    로컬 corp_codes.json에서 기업 목록을 불러옵니다.
+    앱 실행/새로고침 시 OpenDART corpCode.xml API를 호출하지 않습니다.
     """
-    response = dart_get(
-        "corpCode.xml",
-        {"crtfc_key": api_key},
-    )
+    if not CORP_CODES_FILE.exists():
+        raise RuntimeError(
+            "corp_codes.json 파일이 없습니다. "
+            "먼저 update_corp_codes.py를 실행해 기업목록 파일을 생성해 주세요."
+        )
 
     try:
-        with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-            xml_name = next(
-                name for name in zf.namelist()
-                if name.lower().endswith(".xml")
-            )
-            xml_bytes = zf.read(xml_name)
-    except (zipfile.BadZipFile, StopIteration) as exc:
-        raise RuntimeError(
-            "기업 고유번호 파일을 해석하지 못했습니다. OpenDART 응답 또는 API 키 상태를 확인해 주세요."
-        ) from exc
-
-    try:
-        root = ET.fromstring(xml_bytes)
-    except ET.ParseError as exc:
-        raise RuntimeError(
-            "기업 고유번호 XML을 해석하지 못했습니다."
-        ) from exc
-
-    rows: list[dict[str, str]] = []
-    for item in root.findall("list"):
-        row = {child.tag: (child.text or "").strip() for child in item}
-        if row.get("corp_code") and row.get("corp_name"):
-            rows.append(row)
+        with CORP_CODES_FILE.open("r", encoding="utf-8") as f:
+            rows = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("corp_codes.json 파일 형식이 올바르지 않습니다.") from exc
+    except OSError as exc:
+        raise RuntimeError("corp_codes.json 파일을 읽지 못했습니다.") from exc
 
     df = pd.DataFrame(rows)
-    if df.empty:
-        raise RuntimeError("기업 고유번호 목록이 비어 있습니다.")
+    required = {"corp_code", "corp_name", "stock_code"}
+    if df.empty or not required.issubset(df.columns):
+        raise RuntimeError("corp_codes.json에 필요한 기업정보가 없습니다.")
+
+    if "modify_date" not in df.columns:
+        df["modify_date"] = ""
 
     for column in ("corp_code", "corp_name", "stock_code", "modify_date"):
-        if column not in df.columns:
-            df[column] = ""
-
-    df["corp_code"] = df["corp_code"].fillna("").astype(str).str.strip()
-    df["stock_code"] = df["stock_code"].fillna("").astype(str).str.strip()
-    df["corp_name"] = df["corp_name"].fillna("").astype(str).str.strip()
+        df[column] = df[column].fillna("").astype(str).str.strip()
 
     return df[["corp_code", "corp_name", "stock_code", "modify_date"]]
 
@@ -701,14 +684,10 @@ def main() -> None:
     st.subheader("분석 조건")
 
     try:
-        with st.spinner("기업 목록을 불러오고 있습니다..."):
-            corp_df = load_corp_codes(api_key)
+        corp_df = load_corp_codes()
     except Exception as exc:
-        st.error("기업 목록을 불러오지 못했습니다.")
+        st.error("로컬 기업 목록을 불러오지 못했습니다.")
         st.info(str(exc))
-        if st.button("기업 목록 다시 불러오기"):
-            load_corp_codes.clear()
-            st.rerun()
         st.stop()
 
     query = st.text_input(
