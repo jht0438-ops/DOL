@@ -10,6 +10,8 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import requests
 import streamlit as st
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 st.set_page_config(
     page_title="OpenDART DOL 분석",
@@ -19,7 +21,11 @@ st.set_page_config(
 
 DART_BASE_URL = "https://opendart.fss.or.kr/api"
 REPORT_CODE_ANNUAL = "11011"
-REQUEST_TIMEOUT = 25
+# OpenDART 서버가 일시적으로 느릴 때를 대비해 연결/응답 timeout을 분리합니다.
+CONNECT_TIMEOUT = 15
+READ_TIMEOUT = 90
+MAX_RETRIES = 4
+BACKOFF_FACTOR = 1.5
 
 # 너무 작은 변화율은 DOL을 비정상적으로 크게 만들 수 있으므로 주의 처리합니다.
 MIN_SALES_CHANGE_FOR_NORMAL_INTERPRETATION = 0.01  # 1%
@@ -88,24 +94,104 @@ def safe_growth(current: float, previous: float) -> float | None:
 # -----------------------------
 # OpenDART 데이터 조회
 # -----------------------------
+def build_retry_session() -> requests.Session:
+    """
+    OpenDART의 일시적인 연결 지연/5xx 오류에 자동 재시도하는 세션을 만듭니다.
+    API 키가 포함된 실제 요청 URL은 화면에 출력하지 않습니다.
+    """
+    retry = Retry(
+        total=MAX_RETRIES,
+        connect=MAX_RETRIES,
+        read=MAX_RETRIES,
+        status=MAX_RETRIES,
+        backoff_factor=BACKOFF_FACTOR,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        raise_on_status=False,
+    )
+
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (compatible; OpenDART-DOL-Analyzer/1.0)",
+            "Accept": "*/*",
+        }
+    )
+    return session
+
+
+def dart_get(endpoint: str, params: dict[str, Any]) -> requests.Response:
+    """
+    OpenDART GET 요청 공통 함수.
+    오류 시 API 키가 포함된 원문 예외를 그대로 노출하지 않고 일반화된 메시지만 발생시킵니다.
+    """
+    session = build_retry_session()
+    try:
+        response = session.get(
+            f"{DART_BASE_URL}/{endpoint}",
+            params=params,
+            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+        )
+    except requests.exceptions.ConnectTimeout as exc:
+        raise RuntimeError(
+            "OpenDART 서버 연결 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요."
+        ) from exc
+    except requests.exceptions.ReadTimeout as exc:
+        raise RuntimeError(
+            "OpenDART 서버 응답이 지연되고 있습니다. 잠시 후 다시 시도해 주세요."
+        ) from exc
+    except requests.exceptions.ConnectionError as exc:
+        raise RuntimeError(
+            "OpenDART 서버에 연결하지 못했습니다. 네트워크 상태 또는 OpenDART 서버 상태를 확인해 주세요."
+        ) from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            "OpenDART 통신 중 일시적인 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+        ) from exc
+    finally:
+        session.close()
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"OpenDART 서버가 HTTP {response.status_code} 오류를 반환했습니다. 잠시 후 다시 시도해 주세요."
+        )
+
+    return response
+
+
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def load_corp_codes(api_key: str) -> pd.DataFrame:
-    """OpenDART 고유번호 ZIP/XML을 내려받아 기업 목록으로 변환합니다."""
-    response = requests.get(
-        f"{DART_BASE_URL}/corpCode.xml",
-        params={"crtfc_key": api_key},
-        timeout=REQUEST_TIMEOUT,
+    """
+    OpenDART 고유번호 ZIP/XML을 내려받아 기업 목록으로 변환합니다.
+    성공한 결과는 24시간 캐시되므로 Streamlit 재실행 때마다 다시 다운로드하지 않습니다.
+    """
+    response = dart_get(
+        "corpCode.xml",
+        {"crtfc_key": api_key},
     )
-    response.raise_for_status()
 
     try:
         with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-            xml_name = next(name for name in zf.namelist() if name.lower().endswith(".xml"))
+            xml_name = next(
+                name for name in zf.namelist()
+                if name.lower().endswith(".xml")
+            )
             xml_bytes = zf.read(xml_name)
     except (zipfile.BadZipFile, StopIteration) as exc:
-        raise RuntimeError("기업 고유번호 파일을 해석하지 못했습니다. API 키를 확인해 주세요.") from exc
+        raise RuntimeError(
+            "기업 고유번호 파일을 해석하지 못했습니다. OpenDART 응답 또는 API 키 상태를 확인해 주세요."
+        ) from exc
 
-    root = ET.fromstring(xml_bytes)
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as exc:
+        raise RuntimeError(
+            "기업 고유번호 XML을 해석하지 못했습니다."
+        ) from exc
+
     rows: list[dict[str, str]] = []
     for item in root.findall("list"):
         row = {child.tag: (child.text or "").strip() for child in item}
@@ -120,8 +206,10 @@ def load_corp_codes(api_key: str) -> pd.DataFrame:
         if column not in df.columns:
             df[column] = ""
 
+    df["corp_code"] = df["corp_code"].fillna("").astype(str).str.strip()
     df["stock_code"] = df["stock_code"].fillna("").astype(str).str.strip()
     df["corp_name"] = df["corp_name"].fillna("").astype(str).str.strip()
+
     return df[["corp_code", "corp_name", "stock_code", "modify_date"]]
 
 
@@ -133,19 +221,23 @@ def fetch_financial_statement(
     fs_div: str,
 ) -> dict[str, Any]:
     """선택 연도의 사업보고서 전체 재무제표를 조회합니다."""
-    response = requests.get(
-        f"{DART_BASE_URL}/fnlttSinglAcntAll.json",
-        params={
+    response = dart_get(
+        "fnlttSinglAcntAll.json",
+        {
             "crtfc_key": api_key,
             "corp_code": corp_code,
             "bsns_year": str(business_year),
             "reprt_code": REPORT_CODE_ANNUAL,
             "fs_div": fs_div,
         },
-        timeout=REQUEST_TIMEOUT,
     )
-    response.raise_for_status()
-    return response.json()
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError("OpenDART 재무제표 응답을 JSON으로 해석하지 못했습니다.") from exc
+
+    return data
 
 
 def get_statement_with_fallback(
@@ -155,12 +247,22 @@ def get_statement_with_fallback(
 ) -> tuple[list[dict[str, Any]], str]:
     """연결재무제표(CFS)를 우선 조회하고 없으면 별도(OFS)로 전환합니다."""
     messages: list[str] = []
+
     for fs_div, label in (("CFS", "연결재무제표"), ("OFS", "별도재무제표")):
-        data = fetch_financial_statement(api_key, corp_code, business_year, fs_div)
+        data = fetch_financial_statement(
+            api_key,
+            corp_code,
+            business_year,
+            fs_div,
+        )
+
         status = str(data.get("status", ""))
         if status == "000" and data.get("list"):
             return list(data["list"]), label
-        messages.append(f"{label}: {data.get('message', '조회 실패')}")
+
+        # OpenDART가 반환한 공개 메시지만 사용하고 요청 URL/키는 노출하지 않습니다.
+        message = str(data.get("message", "조회 실패"))
+        messages.append(f"{label}: {message}")
 
     raise RuntimeError(" / ".join(messages))
 
@@ -599,9 +701,14 @@ def main() -> None:
     st.subheader("분석 조건")
 
     try:
-        corp_df = load_corp_codes(api_key)
+        with st.spinner("기업 목록을 불러오고 있습니다..."):
+            corp_df = load_corp_codes(api_key)
     except Exception as exc:
-        st.error(f"기업 목록을 불러오지 못했습니다: {exc}")
+        st.error("기업 목록을 불러오지 못했습니다.")
+        st.info(str(exc))
+        if st.button("기업 목록 다시 불러오기"):
+            load_corp_codes.clear()
+            st.rerun()
         st.stop()
 
     query = st.text_input(
@@ -668,10 +775,9 @@ def main() -> None:
                 int(business_year),
                 fs_label,
             )
-        except requests.RequestException as exc:
-            st.error(f"OpenDART 통신 중 오류가 발생했습니다: {exc}")
         except Exception as exc:
-            st.error(f"분석을 완료하지 못했습니다: {exc}")
+            st.error("분석을 완료하지 못했습니다.")
+            st.info(str(exc))
 
 
 if __name__ == "__main__":
