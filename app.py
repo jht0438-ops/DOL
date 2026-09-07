@@ -20,6 +20,7 @@ st.set_page_config(
 
 DART_BASE_URL = "https://opendart.fss.or.kr/api"
 CORP_CODES_FILE = Path(__file__).with_name("corp_codes.json")
+FINANCIAL_DATA_FILE = Path(__file__).with_name("financial_data.csv")
 REPORT_CODE_ANNUAL = "11011"
 # OpenDART 서버가 일시적으로 느릴 때를 대비해 연결/응답 timeout을 분리합니다.
 CONNECT_TIMEOUT = 15
@@ -248,6 +249,93 @@ def get_statement_with_fallback(
         messages.append(f"{label}: {message}")
 
     raise RuntimeError(" / ".join(messages))
+
+
+
+@st.cache_data(show_spinner=False)
+def load_financial_data() -> pd.DataFrame:
+    """
+    로컬 financial_data.csv에서 DOL 분석용 재무데이터를 읽습니다.
+    분석 버튼을 눌러도 OpenDART API를 호출하지 않습니다.
+    """
+    if not FINANCIAL_DATA_FILE.exists():
+        raise RuntimeError(
+            "financial_data.csv 파일이 없습니다. "
+            "먼저 build_financial_data.py를 실행해 재무데이터 파일을 생성해 주세요."
+        )
+
+    try:
+        df = pd.read_csv(
+            FINANCIAL_DATA_FILE,
+            dtype={
+                "corp_code": str,
+                "corp_name": str,
+                "stock_code": str,
+                "fs_label": str,
+                "revenue_account_name": str,
+                "op_account_name": str,
+                "current_period_name": str,
+                "previous_period_name": str,
+            },
+        )
+    except Exception as exc:
+        raise RuntimeError("financial_data.csv 파일을 읽지 못했습니다.") from exc
+
+    required = {
+        "corp_code",
+        "business_year",
+        "revenue_current",
+        "revenue_previous",
+        "op_current",
+        "op_previous",
+    }
+    if df.empty or not required.issubset(df.columns):
+        raise RuntimeError("financial_data.csv에 필요한 재무정보가 없습니다.")
+
+    df["corp_code"] = df["corp_code"].fillna("").astype(str).str.zfill(8)
+    if "stock_code" in df.columns:
+        df["stock_code"] = df["stock_code"].fillna("").astype(str).str.replace(".0", "", regex=False).str.zfill(6)
+
+    df["business_year"] = pd.to_numeric(df["business_year"], errors="coerce").astype("Int64")
+
+    for col in ("revenue_current", "revenue_previous", "op_current", "op_previous"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
+def get_local_financial_values(
+    financial_df: pd.DataFrame,
+    corp_code: str,
+    business_year: int,
+) -> tuple[dict[str, Any], str]:
+    """기업·연도에 해당하는 로컬 재무데이터 한 행을 반환합니다."""
+    match = financial_df[
+        (financial_df["corp_code"].astype(str).str.zfill(8) == str(corp_code).zfill(8))
+        & (financial_df["business_year"] == int(business_year))
+    ]
+
+    if match.empty:
+        raise RuntimeError(
+            f"{business_year}년 재무데이터가 로컬 파일에 없습니다. "
+            "build_financial_data.py를 다시 실행해 데이터를 갱신해 주세요."
+        )
+
+    row = match.iloc[0]
+
+    values = {
+        "revenue_current": float(row["revenue_current"]),
+        "revenue_previous": float(row["revenue_previous"]),
+        "op_current": float(row["op_current"]),
+        "op_previous": float(row["op_previous"]),
+        "revenue_account_name": row.get("revenue_account_name", "매출액"),
+        "op_account_name": row.get("op_account_name", "영업이익"),
+        "current_period_name": row.get("current_period_name", "당기"),
+        "previous_period_name": row.get("previous_period_name", "전기"),
+    }
+
+    fs_label = str(row.get("fs_label", "연결/별도 재무제표"))
+    return values, fs_label
 
 
 # -----------------------------
@@ -672,21 +760,14 @@ def render_result(result: dict[str, Any], company_name: str, stock_code: str, ye
 def main() -> None:
     render_intro()
 
-    api_key = get_api_key()
-    if not api_key:
-        st.error(
-            "OpenDART API 키가 설정되지 않았습니다. "
-            "`.streamlit/secrets.toml`에 `DART_API_KEY = \"발급받은_키\"`를 저장해 주세요."
-        )
-        st.stop()
-
     st.divider()
     st.subheader("분석 조건")
 
     try:
         corp_df = load_corp_codes()
+        financial_df = load_financial_data()
     except Exception as exc:
-        st.error("로컬 기업 목록을 불러오지 못했습니다.")
+        st.error("로컬 데이터를 불러오지 못했습니다.")
         st.info(str(exc))
         st.stop()
 
@@ -724,8 +805,14 @@ def main() -> None:
             )
             selected_row = matches.loc[selected_index]
 
-    current_year = datetime.now().year
-    available_years = list(range(current_year - 1, 2015, -1))
+    available_years = sorted(
+        [int(y) for y in financial_df["business_year"].dropna().unique()],
+        reverse=True,
+    )
+    if not available_years:
+        st.error("financial_data.csv에 분석 가능한 사업연도가 없습니다.")
+        st.stop()
+
     business_year = st.selectbox("분석 사업연도", available_years, index=0)
     st.caption(f"선택한 {business_year}년 사업보고서의 당기와 전기 수치를 비교합니다.")
 
@@ -738,14 +825,12 @@ def main() -> None:
 
     if analyze_clicked and selected_row is not None:
         try:
-            with st.spinner("OpenDART 재무제표를 불러오고 DOL을 계산하고 있습니다..."):
-                rows, fs_label = get_statement_with_fallback(
-                    api_key,
-                    str(selected_row["corp_code"]),
-                    int(business_year),
-                )
-                values = extract_financial_values(rows)
-                result = analyze_dol(values)
+            values, fs_label = get_local_financial_values(
+                financial_df,
+                str(selected_row["corp_code"]),
+                int(business_year),
+            )
+            result = analyze_dol(values)
 
             render_result(
                 result,
